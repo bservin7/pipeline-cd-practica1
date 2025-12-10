@@ -1,0 +1,162 @@
+name: CI-CD BlueGreen+Flags
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.img.outputs.image }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v2
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Build docker image
+      id: img
+      run: |
+        IMAGE_NAME=ms-ejemplo:latest
+        docker build -t $IMAGE_NAME .
+        echo "::set-output name=image::$IMAGE_NAME"
+
+    - name: Upload image tar
+      run: |
+        docker save ms-ejemplo:latest -o image.tar
+        mkdir -p artifacts
+        mv image.tar artifacts/
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: image
+        path: artifacts/image.tar
+
+  deploy-and-test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download image artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: image
+        path: ./artifacts
+
+    - name: Load Docker image
+      run: |
+        docker load -i artifacts/image.tar
+
+    - name: Create kind cluster
+      uses: engineerd/kind-action@v1
+      with:
+        name: kind
+
+    - name: Expose kubeconfig
+      run: |
+        KIND_KUBECONFIG="$(kind get kubeconfig-path --name='kind')"
+        mkdir -p $HOME/.kube
+        cp "$KIND_KUBECONFIG" $HOME/.kube/config
+        kubectl cluster-info
+
+    - name: Apply k8s: postgres + unleash
+      run: |
+        kubectl apply -f k8s/postgres.yaml
+        kubectl apply -f k8s/unleash.yaml
+        # wait for pods
+        kubectl wait --for=condition=available --timeout=120s deploy/unleash || true
+        kubectl get pods -A
+
+    - name: Load image into kind nodes
+      run: |
+        kind load docker-image ms-ejemplo:latest --name kind
+
+    - name: Deploy blue
+      run: |
+        kubectl apply -f k8s/deployment-blue.yaml
+        kubectl apply -f k8s/service-selector-blue.yaml
+        kubectl apply -f k8s/service.yaml || true
+        kubectl rollout status deploy/ms-ejemplo-blue --timeout=120s
+
+    - name: Run migrations
+      run: |
+        # run migration using a temporary pod
+        kubectl run migrate --restart=Never --image=ms-ejemplo:latest --env="DATABASE_URL=postgres://postgres:password@postgres:5432/postgres" -- /bin/sh -c "node migrate.js"
+        kubectl wait --for=condition=complete job/migrate || true
+      continue-on-error: true
+
+    - name: Smoke tests (Preprod)
+      run: |
+        # port-forward service to local port
+        kubectl port-forward svc/ms-ejemplo 30001:80 &
+        sleep 5
+        export BASE_URL=http://127.0.0.1:30001
+        node smoke-test.js || (echo "smoke failed" && exit 4)
+
+    - name: Canary deploy (green small replica)
+      run: |
+        kubectl apply -f k8s/deployment-green.yaml
+        # scale green to 1 for canary
+        kubectl scale deploy/ms-ejemplo-green --replicas=1
+        # temporarily change Service selector to include green for controlled share (manual step simplified below)
+        kubectl apply -f k8s/service-selector-blue.yaml
+
+    - name: Run k6 load test (canary)
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18
+      run: |
+        # Install k6 in runner
+        sudo apt-get update && sudo apt-get install -y wget
+        wget -q -O - https://dl.k6.io/key.gpg | sudo apt-key add -
+        echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update && sudo apt-get install -y k6
+        kubectl port-forward svc/ms-ejemplo 30001:80 &
+        sleep 5
+        export BASE_URL=http://127.0.0.1:30001
+        k6 run --summary-export=summary.json k6/loadtest.js || true
+
+    - name: Analyze k6
+      run: |
+        node analyze_k6.js summary.json
+      continue-on-error: true
+
+    - name: Decide promotion or rollback
+      id: decision
+      run: |
+        set -e
+        node analyze_k6.js summary.json
+        echo "PROMOTE=true" >> $GITHUB_OUTPUT
+      continue-on-error: false
+
+    - name: Promote to production (switch service to green)
+      if: steps.decision.outcome == 'success'
+      run: |
+        # switch service to green selector
+        kubectl apply -f k8s/service.yaml
+        # update service to point to green by changing selector (example)
+        kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"green"}}}'
+        kubectl rollout status deploy/ms-ejemplo-green --timeout=120s
+
+    - name: Rollback to blue (on fail)
+      if: failure()
+      run: |
+        echo "Rollback: ensure service points to blue"
+        kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"blue"}}}'
+        kubectl rollout status deploy/ms-ejemplo-blue --timeout=120s
+
+    - name: Save manifests and logs
+      if: always()
+      run: |
+        kubectl get all -o wide > k8s-state.txt || true
+        tar -czf artifacts.tar.gz k8s-state.txt || true
+    - uses: actions/upload-artifact@v4
+      with:
+        name: cluster-artifacts
+        path: artifacts.tar.gz
