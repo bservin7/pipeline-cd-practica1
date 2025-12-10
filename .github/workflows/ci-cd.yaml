@@ -147,9 +147,7 @@ jobs:
         kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"blue"}}}'
         kubectl rollout status deploy/ms-ejemplo-blue --timeout=150s
 
-    # ---------------------------
     # SAVE ARTIFACTS
-    # ---------------------------
 
     - name: Save manifests and logs
       if: always()
