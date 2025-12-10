@@ -5,6 +5,7 @@ on:
     branches: [ main ]
 
 jobs:
+
   build:
     runs-on: ubuntu-latest
     outputs:
@@ -26,7 +27,7 @@ jobs:
         docker build -t $IMAGE_NAME .
         echo "image=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
-    - name: Upload image tar
+    - name: Save image tar
       run: |
         docker save ms-ejemplo:latest -o image.tar
         mkdir -p artifacts
@@ -43,8 +44,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
     - uses: actions/checkout@v4
 
+    # ---------------------------
+    # DOWNLOAD DOCKER IMAGE
+    # ---------------------------
     - name: Download image artifact
       uses: actions/download-artifact@v4
       with:
@@ -54,17 +59,29 @@ jobs:
     - name: Load Docker image
       run: docker load -i artifacts/image.tar
 
+    # ---------------------------
+    # CREATE KIND CLUSTER (FIJO)
+    # ---------------------------
     - name: Create kind cluster
       uses: helm/kind-action@v1.10.0
       with:
         cluster_name: kind
         wait: 120
+        config: |
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
 
-    - name: Expose kubeconfig
+    - name: Set kubeconfig
       run: |
-        kind get kubeconfig --name kind > ~/.kube/config
-        kubectl cluster-info
+        mkdir -p ~/.kube
+        kind export kubeconfig --name kind
+        kubectl get nodes
 
+    # ---------------------------
+    # DEPLOY INFRA
+    # ---------------------------
     - name: Deploy Postgres + Unleash
       run: |
         kubectl apply -f k8s/postgres.yaml
@@ -76,6 +93,9 @@ jobs:
       run: |
         kind load docker-image ms-ejemplo:latest --name kind
 
+    # ---------------------------
+    # BLUE DEPLOY
+    # ---------------------------
     - name: Deploy BLUE
       run: |
         kubectl apply -f k8s/deployment-blue.yaml
@@ -94,18 +114,17 @@ jobs:
         kubectl port-forward svc/ms-ejemplo 30001:80 &
         sleep 5
         export BASE_URL=http://127.0.0.1:30001
-        node smoke-test.js || (echo "Smoke tests failed" && exit 4)
+        node smoke-test.js
 
     # ---------------------------
-    # CANARY (GREEN) + K6
+    # GREEN CANARY
     # ---------------------------
-
     - name: Deploy GREEN (canary)
       run: |
         kubectl apply -f k8s/deployment-green.yaml
         kubectl scale deploy/ms-ejemplo-green --replicas=1
 
-    - name: Setup Node (needed for k6 tools)
+    - name: Setup Node
       uses: actions/setup-node@v4
       with:
         node-version: 18
@@ -125,7 +144,7 @@ jobs:
         export BASE_URL=http://127.0.0.1:30001
         k6 run --summary-export=summary.json k6/loadtest.js || true
 
-    - name: Analyze k6 results
+    - name: Analyze k6
       id: decision
       continue-on-error: true
       run: |
@@ -135,21 +154,19 @@ jobs:
     # ---------------------------
     # PROMOTE OR ROLLBACK
     # ---------------------------
-
-    - name: Promote GREEN → Production
+    - name: Promote GREEN
       if: steps.decision.outcome == 'success'
       run: |
         kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"green"}}}'
         kubectl rollout status deploy/ms-ejemplo-green --timeout=150s
 
-    - name: Rollback → BLUE
+    - name: Rollback BLUE
       if: failure()
       run: |
         kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"blue"}}}'
         kubectl rollout status deploy/ms-ejemplo-blue --timeout=150s
 
     # SAVE ARTIFACTS
-
     - name: Save manifests and logs
       if: always()
       run: |
