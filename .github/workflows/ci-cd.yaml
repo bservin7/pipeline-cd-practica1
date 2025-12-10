@@ -12,169 +12,166 @@ jobs:
       image: ${{ steps.img.outputs.image }}
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v2
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
 
-    - name: Build docker image
-      id: img
-      run: |
-        IMAGE_NAME=ms-ejemplo:latest
-        docker build -t $IMAGE_NAME .
-        echo "image=$IMAGE_NAME" >> $GITHUB_OUTPUT
+      - name: Build docker image
+        id: img
+        run: |
+          IMAGE_NAME=ms-ejemplo:latest
+          docker build -t $IMAGE_NAME .
+          echo "image=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
-    - name: Save image tar
-      run: |
-        docker save ms-ejemplo:latest -o image.tar
-        mkdir -p artifacts
-        mv image.tar artifacts/
+      - name: Save image tar
+        run: |
+          docker save ms-ejemplo:latest -o image.tar
+          mkdir -p artifacts
+          mv image.tar artifacts/
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: image
-        path: artifacts/image.tar
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: artifacts/image.tar
 
   deploy-and-test:
     needs: build
     runs-on: ubuntu-latest
 
     steps:
+      - uses: actions/checkout@v4
 
-    - uses: actions/checkout@v4
+      # ---------------------------
+      # DOWNLOAD DOCKER IMAGE
+      # ---------------------------
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: ./artifacts
 
-    # ---------------------------
-    # DOWNLOAD DOCKER IMAGE
-    # ---------------------------
-    - name: Download image artifact
-      uses: actions/download-artifact@v4
-      with:
-        name: image
-        path: ./artifacts
+      - name: Load Docker image
+        run: docker load -i artifacts/image.tar
 
-    - name: Load Docker image
-      run: docker load -i artifacts/image.tar
+      # ---------------------------
+      # CREATE KIND CLUSTER
+      # ---------------------------
+      - name: Create kind cluster
+        uses: kind-actions/kind@v1.2.0
+        with:
+          cluster_name: kind
+          wait: 120
 
-    # ---------------------------
-    # CREATE KIND CLUSTER (FIJO)
-    # ---------------------------
-    - name: Create kind cluster
-      uses: helm/kind-action@v1.10.0
-      with:
-        cluster_name: kind
-        wait: 120
-        config: |
-          kind: Cluster
-          apiVersion: kind.x-k8s.io/v1alpha4
-          nodes:
-            - role: control-plane
+      - name: Set kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          kind export kubeconfig --name kind
+          kubectl get nodes
 
-    - name: Set kubeconfig
-      run: |
-        mkdir -p ~/.kube
-        kind export kubeconfig --name kind
-        kubectl get nodes
+      # ---------------------------
+      # DEPLOY INFRA
+      # ---------------------------
+      - name: Deploy Postgres + Unleash
+        run: |
+          kubectl apply -f k8s/postgres.yaml
+          kubectl apply -f k8s/unleash.yaml
+          kubectl wait --for=condition=available --timeout=180s deploy/unleash || true
+          kubectl get pods -A
 
-    # ---------------------------
-    # DEPLOY INFRA
-    # ---------------------------
-    - name: Deploy Postgres + Unleash
-      run: |
-        kubectl apply -f k8s/postgres.yaml
-        kubectl apply -f k8s/unleash.yaml
-        kubectl wait --for=condition=available --timeout=180s deploy/unleash || true
-        kubectl get pods -A
+      - name: Load image into kind nodes
+        run: |
+          kind load docker-image ms-ejemplo:latest --name kind
 
-    - name: Load image into kind nodes
-      run: |
-        kind load docker-image ms-ejemplo:latest --name kind
+      # ---------------------------
+      # BLUE DEPLOY
+      # ---------------------------
+      - name: Deploy BLUE
+        run: |
+          kubectl apply -f k8s/deployment-blue.yaml
+          kubectl apply -f k8s/service-selector-blue.yaml
+          kubectl rollout status deploy/ms-ejemplo-blue --timeout=150s
 
-    # ---------------------------
-    # BLUE DEPLOY
-    # ---------------------------
-    - name: Deploy BLUE
-      run: |
-        kubectl apply -f k8s/deployment-blue.yaml
-        kubectl apply -f k8s/service-selector-blue.yaml
-        kubectl rollout status deploy/ms-ejemplo-blue --timeout=150s
+      - name: Run migrations
+        continue-on-error: true
+        run: |
+          kubectl run migrate --restart=Never --image=ms-ejemplo:latest --env="DATABASE_URL=postgres://postgres:password@postgres:5432/postgres" -- /bin/sh -c "node migrate.js"
+          sleep 5
+          kubectl delete pod migrate --force --grace-period=0 || true
 
-    - name: Run migrations
-      continue-on-error: true
-      run: |
-        kubectl run migrate --restart=Never --image=ms-ejemplo:latest --env="DATABASE_URL=postgres://postgres:password@postgres:5432/postgres" -- /bin/sh -c "node migrate.js"
-        sleep 5
-        kubectl delete pod migrate --force --grace-period=0 || true
+      - name: Smoke tests (Preprod)
+        run: |
+          kubectl port-forward svc/ms-ejemplo 30001:80 &
+          sleep 5
+          export BASE_URL=http://127.0.0.1:30001
+          node smoke-test.js
 
-    - name: Smoke tests (Preprod)
-      run: |
-        kubectl port-forward svc/ms-ejemplo 30001:80 &
-        sleep 5
-        export BASE_URL=http://127.0.0.1:30001
-        node smoke-test.js
+      # ---------------------------
+      # GREEN CANARY
+      # ---------------------------
+      - name: Deploy GREEN (canary)
+        run: |
+          kubectl apply -f k8s/deployment-green.yaml
+          kubectl scale deploy/ms-ejemplo-green --replicas=1
 
-    # ---------------------------
-    # GREEN CANARY
-    # ---------------------------
-    - name: Deploy GREEN (canary)
-      run: |
-        kubectl apply -f k8s/deployment-green.yaml
-        kubectl scale deploy/ms-ejemplo-green --replicas=1
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
 
-    - name: Setup Node
-      uses: actions/setup-node@v4
-      with:
-        node-version: 18
+      - name: Install k6
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg software-properties-common
+          wget -q -O - https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install -y k6
 
-    - name: Install k6
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y wget gnupg software-properties-common
-        wget -q -O - https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6.gpg
-        echo "deb [signed-by=/usr/share/keyrings/k6.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
-        sudo apt-get update && sudo apt-get install -y k6
+      - name: Run k6 Canary Test
+        run: |
+          kubectl port-forward svc/ms-ejemplo 30001:80 &
+          sleep 5
+          export BASE_URL=http://127.0.0.1:30001
+          k6 run --summary-export=summary.json k6/loadtest.js || true
 
-    - name: Run k6 Canary Test
-      run: |
-        kubectl port-forward svc/ms-ejemplo 30001:80 &
-        sleep 5
-        export BASE_URL=http://127.0.0.1:30001
-        k6 run --summary-export=summary.json k6/loadtest.js || true
+      - name: Analyze k6
+        id: decision
+        continue-on-error: true
+        run: |
+          node analyze_k6.js summary.json
+          echo "PROMOTE=true" >> $GITHUB_OUTPUT
 
-    - name: Analyze k6
-      id: decision
-      continue-on-error: true
-      run: |
-        node analyze_k6.js summary.json
-        echo "PROMOTE=true" >> $GITHUB_OUTPUT
+      # ---------------------------
+      # PROMOTE OR ROLLBACK
+      # ---------------------------
+      - name: Promote GREEN
+        if: steps.decision.outcome == 'success'
+        run: |
+          kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"green"}}}'
+          kubectl rollout status deploy/ms-ejemplo-green --timeout=150s
 
-    # ---------------------------
-    # PROMOTE OR ROLLBACK
-    # ---------------------------
-    - name: Promote GREEN
-      if: steps.decision.outcome == 'success'
-      run: |
-        kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"green"}}}'
-        kubectl rollout status deploy/ms-ejemplo-green --timeout=150s
+      - name: Rollback BLUE
+        if: failure()
+        run: |
+          kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"blue"}}}'
+          kubectl rollout status deploy/ms-ejemplo-blue --timeout=150s
 
-    - name: Rollback BLUE
-      if: failure()
-      run: |
-        kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"blue"}}}'
-        kubectl rollout status deploy/ms-ejemplo-blue --timeout=150s
+      # ---------------------------
+      # SAVE ARTIFACTS
+      # ---------------------------
+      - name: Save manifests and logs
+        if: always()
+        continue-on-error: true
+        run: |
+          kubectl get all -A -o wide > k8s-state.txt || true
+          tar -czf artifacts.tar.gz k8s-state.txt
 
-    # SAVE ARTIFACTS
-    - name: Save manifests and logs
-      if: always()
-      run: |
-        kubectl get all -A -o wide > k8s-state.txt
-        tar -czf artifacts.tar.gz k8s-state.txt
-
-    - uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: cluster-artifacts
-        path: artifacts.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cluster-artifacts
+          path: artifacts.tar.gz
