@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-ejemplo
+spec:
+  selector:
+    app: ms-ejemplo
+    version: blue
+  ports:
+    - port: 80
+      targetPort: 3000
