@@ -55,9 +55,10 @@ jobs:
       run: docker load -i artifacts/image.tar
 
     - name: Create kind cluster
-      uses: engineerd/kind-action@v1
+      uses: helm/kind-action@v1.10.0
       with:
-        name: kind
+        cluster_name: kind
+        wait: 120
 
     - name: Expose kubeconfig
       run: |
