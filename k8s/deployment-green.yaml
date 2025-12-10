@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ms-ejemplo-green
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ms-ejemplo
+      version: green
+  template:
+    metadata:
+      labels:
+        app: ms-ejemplo
+        version: green
+    spec:
+      containers:
+      - name: app
+        image: ms-ejemplo:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: DATABASE_URL
+          value: "postgres://postgres:password@postgres:5432/postgres"
+        - name: UNLEASH_URL
+          value: "http://unleash:4242/api"
