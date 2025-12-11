@@ -61,17 +61,36 @@ jobs:
       # ---------------------------
       # CREATE KIND CLUSTER
       # ---------------------------
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/
+
       - name: Create kind cluster
-        uses: container-tools/kind-action@v1
-        with:
-          cluster_name: kind
-          wait: 120
+        run: |
+          cat > kind-config.yaml <<EOF
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            extraPortMappings:
+            - containerPort: 30001
+              hostPort: 30001
+              listenAddress: "0.0.0.0"
+              protocol: TCP
+          EOF
+          
+          kind create cluster --name kind --config kind-config.yaml --wait 120s
 
       - name: Set kubeconfig
         run: |
           mkdir -p ~/.kube
           kind export kubeconfig --name kind
+          kubectl cluster-info
           kubectl get nodes
+          echo "KUBECONFIG content:"
+          cat ~/.kube/config
 
       # ---------------------------
       # DEPLOY INFRA
@@ -80,6 +99,8 @@ jobs:
         run: |
           kubectl apply -f k8s/postgres.yaml
           kubectl apply -f k8s/unleash.yaml
+          sleep 10  # Esperar a que los pods inicien
+          kubectl wait --for=condition=ready pod -l app=postgres --timeout=60s || true
           kubectl wait --for=condition=available --timeout=180s deploy/unleash || true
           kubectl get pods -A
 
@@ -94,21 +115,39 @@ jobs:
         run: |
           kubectl apply -f k8s/deployment-blue.yaml
           kubectl apply -f k8s/service-selector-blue.yaml
-          kubectl rollout status deploy/ms-ejemplo-blue --timeout=150s
+          kubectl wait --for=condition=available --timeout=150s deploy/ms-ejemplo-blue
+          kubectl get pods,svc
 
       - name: Run migrations
         continue-on-error: true
         run: |
-          kubectl run migrate --restart=Never --image=ms-ejemplo:latest --env="DATABASE_URL=postgres://postgres:password@postgres:5432/postgres" -- /bin/sh -c "node migrate.js"
-          sleep 5
+          # Esperar a que Postgres esté listo
+          sleep 15
+          kubectl run migrate --restart=Never --image=ms-ejemplo:latest \
+            --env="DATABASE_URL=postgres://postgres:password@postgres:5432/postgres" \
+            -- /bin/sh -c "node migrate.js"
+          sleep 10
+          kubectl logs migrate
           kubectl delete pod migrate --force --grace-period=0 || true
 
       - name: Smoke tests (Preprod)
         run: |
+          # Verificar que el servicio está disponible
+          kubectl get svc ms-ejemplo
+          # Usar port-forward en background
           kubectl port-forward svc/ms-ejemplo 30001:80 &
-          sleep 5
+          PORT_FORWARD_PID=$!
+          sleep 10  # Dar tiempo al port-forward
+          echo "Port-forward PID: $PORT_FORWARD_PID"
+          
           export BASE_URL=http://127.0.0.1:30001
+          echo "Testing $BASE_URL"
+          curl -v $BASE_URL/health || true
+          
           node smoke-test.js
+          
+          # Matar el proceso de port-forward
+          kill $PORT_FORWARD_PID
 
       # ---------------------------
       # GREEN CANARY
@@ -117,6 +156,7 @@ jobs:
         run: |
           kubectl apply -f k8s/deployment-green.yaml
           kubectl scale deploy/ms-ejemplo-green --replicas=1
+          kubectl wait --for=condition=available --timeout=60s deploy/ms-ejemplo-green
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -134,31 +174,54 @@ jobs:
       - name: Run k6 Canary Test
         run: |
           kubectl port-forward svc/ms-ejemplo 30001:80 &
-          sleep 5
+          PORT_FORWARD_PID=$!
+          sleep 10
+          
           export BASE_URL=http://127.0.0.1:30001
-          k6 run --summary-export=summary.json k6/loadtest.js || true
+          echo "Running k6 tests on $BASE_URL"
+          
+          # Primero verificar que el endpoint responde
+          curl -s $BASE_URL/health
+          
+          k6 run --summary-export=summary.json --out json=results.json k6/loadtest.js || true
+          
+          kill $PORT_FORWARD_PID
 
       - name: Analyze k6
         id: decision
         continue-on-error: true
         run: |
-          node analyze_k6.js summary.json
-          echo "PROMOTE=true" >> $GITHUB_OUTPUT
+          if [ -f "summary.json" ]; then
+            node analyze_k6.js summary.json
+            echo "PROMOTE=true" >> $GITHUB_OUTPUT
+          else
+            echo "No summary.json found, assuming failure"
+            echo "PROMOTE=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
 
       # ---------------------------
       # PROMOTE OR ROLLBACK
       # ---------------------------
       - name: Promote GREEN
-        if: steps.decision.outcome == 'success'
+        if: steps.decision.outputs.PROMOTE == 'true'
         run: |
+          echo "Promoting GREEN deployment"
           kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"green"}}}'
+          kubectl scale deploy/ms-ejemplo-green --replicas=3
           kubectl rollout status deploy/ms-ejemplo-green --timeout=150s
+          kubectl get svc ms-ejemplo -o jsonpath='{.spec.selector}'
 
       - name: Rollback BLUE
-        if: failure()
+        if: steps.decision.outputs.PROMOTE == 'false'
         run: |
+          echo "Rolling back to BLUE deployment"
           kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"app":"ms-ejemplo","version":"blue"}}}'
+          kubectl scale deploy/ms-ejemplo-blue --replicas=3
           kubectl rollout status deploy/ms-ejemplo-blue --timeout=150s
+          # Limpiar GREEN
+          kubectl delete deploy/ms-ejemplo-green --ignore-not-found=true
+          kubectl get svc ms-ejemplo -o jsonpath='{.spec.selector}'
 
       # ---------------------------
       # SAVE ARTIFACTS
@@ -167,7 +230,8 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          kubectl get all -A -o wide > k8s-state.txt || true
+          kubectl get all -A -o wide > k8s-state.txt 2>&1 || true
+          kubectl logs -l app=ms-ejemplo --tail=50 >> k8s-state.txt 2>&1 || true
           tar -czf artifacts.tar.gz k8s-state.txt
 
       - uses: actions/upload-artifact@v4
