@@ -1,18 +1,60 @@
 apiVersion: v1
-kind: Pod
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: postgres
 spec:
-  containers:
-  - name: postgres
-    image: postgres:15-alpine
-    env:
-    - name: POSTGRES_PASSWORD
-      value: "password"
-    - name: POSTGRES_DB
-      value: "postgres"
-    ports:
-    - containerPort: 5432
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_PASSWORD
+          value: "password"
+        - name: POSTGRES_DB
+          value: "postgres"
+        - name: POSTGRES_USER
+          value: "postgres"
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - mountPath: /var/lib/postgresql/data
+          name: postgres-data
+        livenessProbe:
+          tcpSocket:
+            port: 5432
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - exec pg_isready -U postgres -h 127.0.0.1
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: postgres-pvc
 ---
 apiVersion: v1
 kind: Service
@@ -23,3 +65,4 @@ spec:
     app: postgres
   ports:
   - port: 5432
+    targetPort: 5432
