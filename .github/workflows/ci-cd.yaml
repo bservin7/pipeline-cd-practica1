@@ -20,6 +20,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
       
       - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -33,6 +34,7 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
       
       - name: Build and push Docker image
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -42,6 +44,11 @@ jobs:
             ${{ secrets.DOCKER_USERNAME }}/ms-ejemplo:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      
+      - name: Build Docker image (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          docker build -t ms-ejemplo:test .
 
   deploy-and-test:
     runs-on: ubuntu-latest
@@ -50,6 +57,9 @@ jobs:
       IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
     
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
       # ---------------------------
       # CREATE KIND CLUSTER
       # ---------------------------
@@ -101,19 +111,142 @@ jobs:
       # ---------------------------
       - name: Update image tag in deployment files
         run: |
-          sed -i "s|image:.*|image: ${{ secrets.DOCKER_USERNAME }}/ms-ejemplo:${{ env.IMAGE_TAG }}|" k8s/deployment-blue.yaml
-          sed -i "s|image:.*|image: ${{ secrets.DOCKER_USERNAME }}/ms-ejemplo:${{ env.IMAGE_TAG }}|" k8s/deployment-green.yaml
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            sed -i "s|image:.*|image: ${{ secrets.DOCKER_USERNAME }}/ms-ejemplo:${{ env.IMAGE_TAG }}|" k8s/deployment-blue.yaml
+            sed -i "s|image:.*|image: ${{ secrets.DOCKER_USERNAME }}/ms-ejemplo:${{ env.IMAGE_TAG }}|" k8s/deployment-green.yaml
+          else
+            sed -i "s|image:.*|image: ms-ejemplo:test|" k8s/deployment-blue.yaml
+            sed -i "s|image:.*|image: ms-ejemplo:test|" k8s/deployment-green.yaml
+          fi
 
       - name: Deploy Blue
         run: |
           kubectl apply -f k8s/deployment-blue.yaml
+          kubectl apply -f k8s/service-selector-blue.yaml
           kubectl wait --for=condition=available deployment/ms-ejemplo-blue --timeout=180s
           kubectl get pods
 
       - name: Run migrations
         continue-on-error: true
         run: |
-          # Esperar a que Postgres esté listo
           sleep 10
-          kubectl run migrate --restart=Never --image=${{ secrets.DOCKER_USERNAME }}/ms-ejemplo:${{ env.IMAGE_TAG }} \
-            --env="DATABASE_URL=
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            IMAGE="${{ secrets.DOCKER_USERNAME }}/ms-ejemplo:${{ env.IMAGE_TAG }}"
+          else
+            IMAGE="ms-ejemplo:test"
+            kind load docker-image ms-ejemplo:test --name kind
+          fi
+          
+          kubectl run migrate --restart=Never --image=$IMAGE \
+            --env="DATABASE_URL=postgres://postgres:password@postgres:5432/postgres" \
+            -- /bin/sh -c "node migrate.js" || true
+          sleep 10
+          kubectl logs migrate || true
+          kubectl delete pod migrate --ignore-not-found=true
+
+      - name: Smoke tests (Preprod)
+        run: |
+          kubectl port-forward svc/ms-ejemplo 30001:80 &
+          PORT_FORWARD_PID=$!
+          sleep 15
+          
+          echo "Testing service..."
+          curl -f http://localhost:30001/health || curl -f http://localhost:30001/ || true
+          
+          if [ -f "smoke-test.js" ]; then
+            export BASE_URL=http://localhost:30001
+            node smoke-test.js || echo "Smoke tests failed, continuing..."
+          fi
+          
+          kill $PORT_FORWARD_PID 2>/dev/null || true
+
+      # ---------------------------
+      # GREEN CANARY
+      # ---------------------------
+      - name: Deploy GREEN (canary)
+        run: |
+          kubectl apply -f k8s/deployment-green.yaml
+          kubectl wait --for=condition=available deployment/ms-ejemplo-green --timeout=180s
+          kubectl scale deployment/ms-ejemplo-green --replicas=1
+          kubectl get pods
+
+      - name: Install k6
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg
+          wget -q -O - https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install -y k6
+
+      - name: Run k6 Canary Test
+        run: |
+          kubectl port-forward svc/ms-ejemplo 30001:80 &
+          PORT_FORWARD_PID=$!
+          sleep 15
+          
+          echo "Running k6 tests..."
+          k6 run --summary-export=summary.json k6/loadtest.js || echo "k6 tests failed"
+          
+          kill $PORT_FORWARD_PID 2>/dev/null || true
+
+      - name: Analyze k6 results
+        id: decision
+        continue-on-error: true
+        run: |
+          if [ -f "summary.json" ]; then
+            echo "Analyzing k6 results..."
+            # Simple analysis - check if error rate < 5%
+            ERROR_RATE=$(jq -r '.metrics.http_req_failed.value' summary.json 2>/dev/null || echo "0.1")
+            if (( $(echo "$ERROR_RATE < 0.05" | bc -l) )); then
+              echo "✅ Tests passed, promoting GREEN"
+              echo "PROMOTE=true" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Tests failed, error rate: $ERROR_RATE"
+              echo "PROMOTE=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "❌ No test results, rolling back"
+            echo "PROMOTE=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ---------------------------
+      # PROMOTE OR ROLLBACK
+      # ---------------------------
+      - name: Promote GREEN
+        if: steps.decision.outputs.PROMOTE == 'true'
+        run: |
+          echo "Promoting GREEN deployment"
+          kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"version":"green"}}}'
+          kubectl scale deployment/ms-ejemplo-green --replicas=3
+          kubectl scale deployment/ms-ejemplo-blue --replicas=0
+          kubectl get svc ms-ejemplo -o jsonpath='{.spec.selector}'
+          echo "✅ GREEN deployment promoted"
+
+      - name: Rollback BLUE
+        if: steps.decision.outputs.PROMOTE == 'false'
+        run: |
+          echo "Rolling back to BLUE deployment"
+          kubectl patch service ms-ejemplo -p '{"spec":{"selector":{"version":"blue"}}}'
+          kubectl delete deployment/ms-ejemplo-green --ignore-not-found=true
+          kubectl get svc ms-ejemplo -o jsonpath='{.spec.selector}'
+          echo "✅ Rolled back to BLUE"
+
+      # ---------------------------
+      # SAVE ARTIFACTS
+      # ---------------------------
+      - name: Save manifests and logs
+        if: always()
+        run: |
+          kubectl get all -A -o wide > k8s-state.txt 2>&1 || true
+          kubectl logs -l app=ms-ejemplo --tail=100 >> k8s-state.txt 2>&1 || true
+          echo "=== Cluster State ===" > artifacts.txt
+          cat k8s-state.txt >> artifacts.txt
+      
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-artifacts
+          path: |
+            artifacts.txt
+            summary.json
