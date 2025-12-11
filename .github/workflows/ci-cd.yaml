@@ -1,4 +1,4 @@
-name: CI/CD Blue-Green with Canary
+name: CI/CD Blue-Green with Canary 
 
 on:
   push:
