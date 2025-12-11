@@ -1,9 +1,10 @@
+cat > k8s/deployment-blue.yaml <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ms-ejemplo-blue
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       app: ms-ejemplo
@@ -16,24 +17,14 @@ spec:
     spec:
       containers:
       - name: ms-ejemplo
-        image: ms-ejemplo:latest  # Se reemplaza en el pipeline
+        image: ms-ejemplo:latest
         ports:
         - containerPort: 3000
         env:
         - name: DATABASE_URL
           value: "postgres://postgres:password@postgres:5432/postgres"
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 3000
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 3000
-          initialDelaySeconds: 5
-          periodSeconds: 5
+        - name: UNLEASH_URL
+          value: "http://unleash:4242/api"
 ---
 apiVersion: v1
 kind: Service
@@ -46,3 +37,4 @@ spec:
   ports:
   - port: 80
     targetPort: 3000
+EOF
