@@ -62,7 +62,7 @@ jobs:
       # CREATE KIND CLUSTER
       # ---------------------------
       - name: Create kind cluster
-        uses: engineerd/kind-action@v1
+        uses: container-tools/kind-action@v1
         with:
           cluster_name: kind
           wait: 120
